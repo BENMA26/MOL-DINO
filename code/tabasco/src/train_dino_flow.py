@@ -145,12 +145,23 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--resume_from", default=None)
+    p.add_argument("--debug", action="store_true",
+                   help="Debug mode: 2 epochs, 8 samples, CPU, no precision tricks")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── debug mode ────────────────────────────────────────────────────────────
+    if args.debug:
+        print("=" * 50)
+        print("DEBUG MODE: 2 epochs, 8 samples, CPU, no precision tricks")
+        print("=" * 50)
+        args.max_epochs = 2
+        args.batch_size = 2
+        args.num_workers = 0
 
     # ── data ──────────────────────────────────────────────────────────────────
     train_ds = UnconditionalLMDBDataset(
@@ -163,6 +174,11 @@ def main():
         split="val",
         lmdb_dir=os.path.join(args.lmdb_dir, "val"),
     )
+
+    if args.debug:
+        from torch.utils.data import Subset
+        train_ds = Subset(train_ds, range(min(8, len(train_ds))))
+        val_ds = Subset(val_ds, range(min(8, len(val_ds))))
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
@@ -200,12 +216,13 @@ def main():
 
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        accelerator="gpu" if (torch.cuda.is_available() and not args.debug) else "cpu",
         devices=args.devices,
         callbacks=[ckpt_cb],
         logger=logger,
         gradient_clip_val=1.0,
-        precision="bf16-mixed" if torch.cuda.is_available() else 32,
+        precision="bf16-mixed" if (torch.cuda.is_available() and not args.debug) else 32,
+        fast_dev_run=args.debug,
     )
 
     trainer.fit(

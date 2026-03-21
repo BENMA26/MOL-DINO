@@ -253,12 +253,23 @@ def parse_args():
     p.add_argument("--n_samples", type=int, default=1000)
     p.add_argument("--num_steps", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--debug", action="store_true",
+                   help="Debug mode: only sample 4 molecules, CPU")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.debug:
+        print("=" * 50)
+        print("DEBUG MODE: 4 samples, CPU, num_steps=2")
+        print("=" * 50)
+        args.n_samples = 4
+        args.batch_size = 2
+        args.num_steps = 2
+
+    device = torch.device("cpu" if args.debug else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     print("Loading autoencoder...")
     ae_model = DinoAELitModule.load_from_checkpoint(args.ae_ckpt, map_location=device)
