@@ -797,8 +797,7 @@ class RelaTransEncoder(nn.Module):
             nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
             self.cls_edge_embedding = nn.Parameter(torch.zeros(1, hidden_dim // 4))
             nn.init.xavier_uniform_(self.cls_edge_embedding)
-
-        
+      
     def forward(self, data, node_feature, edge_index, edge_feature, position, pos_mask=None, return_cls=False):
         masked_position = position
         if pos_mask is not None:
