@@ -68,9 +68,20 @@ class FlowMatchingTrainer(L.LightningModule):
             encoder = load_encoder_params(encoder, args.encoder_ckpt)
             print(f"Loaded encoder weights from {args.encoder_ckpt}")
 
+        # 两阶段训练逻辑 (UNILIP-style)
+        if args.stage == 1:
+            # Stage 1: 固定编码器，只训练解码器
+            encoder.requires_grad_(False)
+            print("Stage 1: Encoder frozen, training decoder only.")
+        elif args.stage == 2:
+            # Stage 2: 微调编码器和解码器
+            encoder.requires_grad_(True)
+            print("Stage 2: Finetuning both encoder and decoder.")
+
+        # 兼容旧的 freeze_encoder 参数
         if args.freeze_encoder:
             encoder.requires_grad_(False)
-            print("Encoder frozen.")
+            print("Encoder frozen (via --freeze_encoder flag).")
 
         # ── decoder ───────────────────────────────────────────
         decoder = DAEDecoder(
@@ -90,8 +101,6 @@ class FlowMatchingTrainer(L.LightningModule):
             encoder=encoder,
             decoder=decoder,
             hidden_dim=args.hidden_dim,
-            kl_dim=args.kl_dim,
-            kl_weight=args.kl_weight,
         )
 
         # ── interpolants ──────────────────────────────────────
@@ -164,6 +173,8 @@ class FlowMatchingTrainer(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         self._set_current_data(batch)
+        #print("batch.batch shape:", batch.batch.shape)  # 加这行
+        #print("batch.pos shape:", batch.pos.shape)      # 加这行
         flow_batch = self._to_flow_batch(batch)
         loss, stats = self.flow_model(flow_batch, compute_stats=True)
         self.log('val/loss', loss, batch_size=self.args.inference_batch_size, prog_bar=True)
@@ -221,6 +232,15 @@ def main(args):
 
     trainer_model = FlowMatchingTrainer(args, prior_model=prior_model)
 
+    # Stage 2: 如果从 Stage 1 checkpoint 恢复，只加载模型权重
+    if args.stage == 2 and args.ckpt_path:
+        print(f"Stage 2: Loading model weights from {args.ckpt_path}")
+        ckpt = torch.load(args.ckpt_path, map_location='cpu')
+        trainer_model.load_state_dict(ckpt['state_dict'], strict=False)
+        print("Stage 2: Model weights loaded successfully (optimizer state skipped)")
+        # 清空 ckpt_path，避免 Lightning 再次尝试加载
+        args.ckpt_path = None
+
     if args.disable_compile:
         pass
     else:
@@ -231,12 +251,27 @@ def main(args):
 
     logger = CSVLogger(save_dir=f'./all_checkpoints/{args.filename}/')
 
+    # 配置 DDP strategy（Stage 1 需要 find_unused_parameters=True）
+    from lightning.pytorch.strategies import DDPStrategy
+    if isinstance(device_cast(args.devices), list) and len(device_cast(args.devices)) > 1:
+        # 多 GPU 训练，使用 DDP
+        if args.stage == 1:
+            # Stage 1: encoder 冻结，需要 find_unused_parameters=True
+            strategy = DDPStrategy(find_unused_parameters=True)
+        else:
+            # Stage 2: 所有参数都参与训练
+            strategy = DDPStrategy(find_unused_parameters=False)
+    else:
+        # 单 GPU 训练
+        strategy = 'auto'
+
     trainer = L.Trainer(
         max_epochs=args.max_epochs,
         max_steps=args.max_steps,
         accelerator=args.accelerator,
         devices=device_cast(args.devices),
         precision=args.precision,
+        strategy=strategy,
         logger=logger,
         callbacks=custom_callbacks(args),
         check_val_every_n_epoch=args.check_val_every_n_epoch,
@@ -302,7 +337,6 @@ if __name__ == '__main__':
     parser.add_argument('--prior_model', action='store_true', default=False)
     parser.add_argument('--use_cls_token', action='store_true', default=False)
     parser.add_argument('--dataset', type=str, default='qm9')
-    parser.add_argument('--dataset_arg', type=str, default='homo')
     parser.add_argument('--delta', type=int, default=1000)
     parser.add_argument('--encoder_ckpt', type=str, default='',
                         help='Path to pretrained encoder checkpoint')
@@ -316,9 +350,11 @@ if __name__ == '__main__':
     parser.add_argument('--max_num_atoms', type=int, default=29,
                         help='Max atoms per molecule in QM9')
 
-    # ── VAE bottleneck ────────────────────────────────────────
-    parser.add_argument('--kl_dim', type=int, default=6)
-    parser.add_argument('--kl_weight', type=float, default=1e-6)
+    # ── Two-stage training (UNILIP-style) ────────────────────
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2],
+                        help='Training stage: 1=freeze encoder, 2=finetune encoder')
+    parser.add_argument('--stage1_ckpt', type=str, default=None,
+                        help='Checkpoint from stage 1 to resume stage 2 training')
 
     # ── flow matching ─────────────────────────────────────────
     parser.add_argument('--time_distribution', type=str, default='uniform',

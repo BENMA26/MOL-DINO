@@ -68,6 +68,7 @@ def custom_callbacks(args):
                                          filename='{epoch:02d}',
                                          every_n_epochs=args.save_every_n_epochs,
                                          save_top_k=-1,
+                                         save_last=True,
                                          save_on_train_epoch_end=True))
 
     if args.test_every_n_epochs is not None:

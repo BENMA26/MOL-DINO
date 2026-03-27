@@ -261,12 +261,15 @@ class FlowMatchingModel(nn.Module):
             stats_dict = {
                 "atomics_loss": atomics_loss,
                 "coords_loss": coords_loss,
-                "kl_loss": kl_loss,
                 "rmsd": rmsd,
                 **atomics_stats,
                 **coord_stats,
                 **dists_stats,
             }
+
+            # 只在 kl_loss 不为 None 时记录
+            if kl_loss is not None:
+                stats_dict["kl_loss"] = kl_loss
 
             atomics_logit_norm = pred["atomics"].norm(dim=-1)
             atomics_logit_max, _ = pred["atomics"].max(dim=-1)
@@ -280,7 +283,10 @@ class FlowMatchingModel(nn.Module):
         else:
             stats_dict = {}
 
-        total_loss = atomics_loss + coords_loss + dists_loss + kl_loss
+        # 处理 kl_loss 为 None 的情况
+        total_loss = atomics_loss + coords_loss + dists_loss
+        if kl_loss is not None:
+            total_loss = total_loss + kl_loss
 
         return total_loss, stats_dict
 

@@ -798,7 +798,7 @@ class RelaTransEncoder(nn.Module):
             self.cls_edge_embedding = nn.Parameter(torch.zeros(1, hidden_dim // 4))
             nn.init.xavier_uniform_(self.cls_edge_embedding)
       
-    def forward(self, data, node_feature, edge_index, edge_feature, position, pos_mask=None, return_cls=False):
+    def forward(self, data, node_feature, edge_index, edge_feature, position, pos_mask=None, return_cls=False, return_node_rep=False):
         masked_position = position
         if pos_mask is not None:
             masked_position = position[~pos_mask] 
@@ -838,6 +838,7 @@ class RelaTransEncoder(nn.Module):
 
         vec = torch.zeros(h.size(0), 3, h.size(1), device=h.device)
 
+        edge_feature = torch.cat([edge_feature, distance], dim=-1)
         edge_h = self.edge_embedding(edge_feature) #[num_edges,hidden_dim//4]
         num_real_nodes = h.size(0)
         cls_rep = None
@@ -886,7 +887,7 @@ class RelaTransEncoder(nn.Module):
             h = h[:num_real_nodes]
             vec = vec[:num_real_nodes]
 
-        if self.args.dataset == 'qm9' or self.args.dataset == 'md17':
+        if (self.args.dataset == 'qm9' or self.args.dataset == 'md17') and not return_node_rep:
             if self.args.dataset_arg == 'dipole_moment':
                 pred = self.output_model.pre_reduce(x=h,v=vec,z=data.z,pos=data.pos,batch=data.batch)
                 pred = scatter_sum(pred, data.batch, dim=0)
@@ -943,6 +944,7 @@ class RelaTrans2DEncoder(nn.Module):
         
     def forward(self, data, node_feature, edge_index, edge_feature):
         h = self.node_embedding(node_feature)
+        edge_feature = torch.cat([edge_feature, distance], dim=-1)
         edge_h = self.edge_embedding(edge_feature)
 
         for block in self.encoder_blocks:

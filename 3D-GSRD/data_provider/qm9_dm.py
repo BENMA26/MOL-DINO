@@ -114,7 +114,7 @@ class QM9DM(L.LightningDataModule):
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=self.args.num_workers,
+            num_workers=0,
             pin_memory=pin_memory,
             drop_last=drop_last,
             collate_fn=self.collate_fn

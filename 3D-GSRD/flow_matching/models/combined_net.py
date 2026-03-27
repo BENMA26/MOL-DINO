@@ -14,8 +14,10 @@ class CombinedNet(nn.Module):
     桥接 RelaTransEncoder 和 DAEDecoder。
     对外暴露 FlowMatchingModel 需要的三个接口：
         forward(coord_ori, atomics_ori, padding_mask, coord_t, atomics_t, t)
-        encode_z(coord_ori, atomics_ori, padding_mask, return_kl=False)
+        encode_z(coord_ori, atomics_ori, padding_mask)
         decode_z(z, coord_t, atomics_t, padding_mask, t)
+
+    移除了 VAE 瓶颈，直接传递 encoder 输出到 decoder。
     """
 
     def __init__(
@@ -23,29 +25,16 @@ class CombinedNet(nn.Module):
         encoder: RelaTransEncoder,
         decoder: DAEDecoder,
         hidden_dim: int,
-        kl_dim: int = 6,
-        kl_weight: float = 1e-6,
     ):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.kl_weight = kl_weight
-
-        # VAE 瓶颈
-        self.quant_conv = nn.Linear(hidden_dim, kl_dim * 2)
-        self.quant_conv_out = nn.Linear(kl_dim, hidden_dim)
+        self.hidden_dim = hidden_dim
 
         # 用于在 training_step 中注入当前 batch
         self._current_data = None
 
     # ── 内部工具 ──────────────────────────────────────────────
-
-    def _reparameterize(self, mu, logvar):
-        """训练时加噪，推理时取均值。"""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            return mu + std * torch.randn_like(std)
-        return mu
 
     def _encode_to_dense(self):
         """
@@ -74,6 +63,7 @@ class CombinedNet(nn.Module):
             position=data.pos,
             pos_mask=None,
             return_cls=False,
+            return_node_rep=True,
         )
         h_dense, mask = to_dense_batch(h, data.batch)  # [B, N, H], [B, N]
         padding_mask = ~mask                            # True=padding
@@ -81,35 +71,26 @@ class CombinedNet(nn.Module):
 
     # ── FlowMatchingModel 需要的三个接口 ─────────────────────
 
-    def encode_z(self, coord_ori, atomics_ori, padding_mask, return_kl=False):
-        """推理时由 FlowMatchingModel.encode() 调用。"""
+    def encode_z(self, coord_ori, atomics_ori, padding_mask):
+        """推理时由 FlowMatchingModel.encode() 调用。
+        直接返回 encoder 输出，不经过 VAE 瓶颈。
+        """
         h_dense, padding_mask_enc = self._encode_to_dense()
-
-        moments = self.quant_conv(h_dense)                   # [B, N, kl_dim*2]
-        mu, logvar = torch.chunk(moments, 2, dim=-1)         # 各 [B, N, kl_dim]
-        z = self._reparameterize(mu, logvar)                 # [B, N, kl_dim]
-
-        # KL loss，padding 位置不参与计算
-        real_mask = (~padding_mask_enc).unsqueeze(-1)        # [B, N, 1]
-        kl_item = (1 + logvar - mu.pow(2) - logvar.exp()) * real_mask
-        kl_loss = -0.5 * torch.mean(kl_item.sum(dim=-1)) * self.kl_weight
-
-        if return_kl:
-            return z, kl_loss
-        return z
+        return h_dense  # [B, N, hidden_dim]
 
     def decode_z(self, z, coord_t, atomics_t, padding_mask, t):
-        """推理时由 FlowMatchingModel.decode_step() 调用。"""
-        encode_embed = self.quant_conv_out(z)                # [B, N, hidden_dim]
+        """推理时由 FlowMatchingModel.decode_step() 调用。
+        z 已经是 hidden_dim，直接传给 decoder。
+        """
         coords, atom_logits = self.decoder.decode_z(
-            encode_embed, coord_t, atomics_t, padding_mask, t
+            z, coord_t, atomics_t, padding_mask, t
         )
         return coords, atom_logits
 
     def forward(self, coord_ori, atomics_ori, padding_mask, coord_t, atomics_t, t):
-        """训练时由 FlowMatchingModel._call_net() 调用。"""
-        z, kl_loss = self.encode_z(
-            coord_ori, atomics_ori, padding_mask, return_kl=True
-        )
+        """训练时由 FlowMatchingModel._call_net() 调用。
+        不再返回 kl_loss。
+        """
+        z = self.encode_z(coord_ori, atomics_ori, padding_mask)
         coords, atom_logits = self.decode_z(z, coord_t, atomics_t, padding_mask, t)
-        return coords, atom_logits, kl_loss
+        return coords, atom_logits, None  # 保持接口兼容，返回 None 作为 kl_loss
