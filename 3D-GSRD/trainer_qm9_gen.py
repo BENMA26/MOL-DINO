@@ -1,5 +1,6 @@
 import math
 import argparse
+import copy
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -29,21 +30,56 @@ class LinearWarmupCosineLRSchedulerV2:
         self.warmup_iters = warmup_iters
         self.warmup_start_lr = warmup_start_lr if warmup_start_lr >= 0 else init_lr
         self.lr_decay_iters = max_iters
+        self.last_step = -1
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
 
     def get_lr(self, it):
         if it < self.warmup_iters:
             return self.init_lr * it / max(self.warmup_iters, 1)
         if it > self.lr_decay_iters:
             return self.min_lr
-        decay_ratio = (it - self.warmup_iters) / (self.lr_decay_iters - self.warmup_iters)
+        decay_ratio = (it - self.warmup_iters) / max(self.lr_decay_iters - self.warmup_iters, 1)
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.min_lr + coeff * (self.init_lr - self.min_lr)
 
-    def step(self, cur_step):
+    def step(self, cur_step=None):
+        if cur_step is None:
+            cur_step = self.last_step + 1
+        self.last_step = cur_step
         lr = self.get_lr(cur_step)
+        new_lrs = []
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+            lr_scale = float(param_group.get('lr_scale', 1.0))
+            group_lr = lr * lr_scale
+            param_group['lr'] = group_lr
+            new_lrs.append(group_lr)
+        self._last_lr = new_lrs
         return lr
+
+    def get_last_lr(self):
+        return self._last_lr
+
+    def state_dict(self):
+        return {
+            'max_iters': self.max_iters,
+            'min_lr': self.min_lr,
+            'init_lr': self.init_lr,
+            'warmup_iters': self.warmup_iters,
+            'warmup_start_lr': self.warmup_start_lr,
+            'lr_decay_iters': self.lr_decay_iters,
+            'last_step': self.last_step,
+            '_last_lr': self._last_lr,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.max_iters = state_dict.get('max_iters', self.max_iters)
+        self.min_lr = state_dict.get('min_lr', self.min_lr)
+        self.init_lr = state_dict.get('init_lr', self.init_lr)
+        self.warmup_iters = state_dict.get('warmup_iters', self.warmup_iters)
+        self.warmup_start_lr = state_dict.get('warmup_start_lr', self.warmup_start_lr)
+        self.lr_decay_iters = state_dict.get('lr_decay_iters', self.lr_decay_iters)
+        self.last_step = state_dict.get('last_step', self.last_step)
+        self._last_lr = state_dict.get('_last_lr', self._last_lr)
 
 
 class FlowMatchingTrainer(L.LightningModule):
@@ -126,6 +162,16 @@ class FlowMatchingTrainer(L.LightningModule):
             num_random_augmentations=None,
             sample_schedule=args.sample_schedule,
         )
+        # Stage-2 ablation: optional latent noise at encoder output.
+        if args.stage == 2 and args.latent_noise_std > 0:
+            self.flow_model.net.latent_noise_std = args.latent_noise_std
+            print(f"Stage 2: latent noise enabled (std={args.latent_noise_std}).")
+
+        # Stage-2 ablation: optional self-distillation.
+        self.use_self_distill = args.stage == 2 and args.distill_weight > 0
+        self.distill_decay = args.distill_decay
+        self.distill_min_ratio = float(args.distill_min_ratio)
+        self.teacher_encoder = None
 
         # data_stats 在 on_fit_start 里注入
         self._data_stats = {
@@ -155,6 +201,83 @@ class FlowMatchingTrainer(L.LightningModule):
             batch_size=B,
         ).to(batch.pos.device)
 
+    def _encode_dense_with_encoder(self, encoder, batch):
+        """Encode a PyG batch with a specific encoder and convert to dense nodes."""
+        if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+            edge_feature = batch.edge_attr
+        else:
+            edge_dim = encoder.edge_embedding[0].in_features - 1
+            edge_feature = torch.zeros(
+                batch.edge_index.shape[1],
+                edge_dim,
+                device=batch.pos.device,
+                dtype=batch.pos.dtype,
+            )
+
+        h, _ = encoder(
+            data=batch,
+            node_feature=batch.x,
+            edge_index=batch.edge_index,
+            edge_feature=edge_feature,
+            position=batch.pos,
+            pos_mask=None,
+            return_cls=False,
+            return_node_rep=True,
+        )
+        h_dense, mask = to_dense_batch(h, batch.batch)
+        padding_mask = ~mask
+        return h_dense, padding_mask
+
+    def _maybe_init_teacher_encoder(self):
+        if not self.use_self_distill:
+            return
+        if self.teacher_encoder is not None:
+            return
+        self.teacher_encoder = copy.deepcopy(self.flow_model.net.encoder)
+        self.teacher_encoder.requires_grad_(False)
+        self.teacher_encoder.eval()
+        print("Stage 2: initialized self-distillation teacher encoder.")
+
+    def _distill_decay_ratio(self):
+        mode = self.distill_decay
+        if mode in {'none', 'None'}:
+            return 1.0
+
+        min_ratio = min(max(self.distill_min_ratio, 0.0), 1.0)
+        progress = 0.0
+
+        trainer = getattr(self, 'trainer', None)
+        if trainer is not None:
+            total_steps = int(getattr(trainer, 'estimated_stepping_batches', 0) or 0)
+            if total_steps > 0:
+                progress = min(max(self.global_step / float(total_steps), 0.0), 1.0)
+            else:
+                max_epochs = int(getattr(self.args, 'max_epochs', 0) or 0)
+                if max_epochs > 0:
+                    progress = min(max(self.current_epoch / float(max_epochs), 0.0), 1.0)
+
+        if mode == 'linear':
+            ratio = 1.0 - (1.0 - min_ratio) * progress
+        elif mode == 'cosine':
+            ratio = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            ratio = 1.0
+        return min(max(ratio, min_ratio), 1.0)
+
+    def _compute_distill_loss(self, batch):
+        if not self.use_self_distill:
+            return None
+        self._maybe_init_teacher_encoder()
+
+        with torch.no_grad():
+            h_teacher, pad_teacher = self._encode_dense_with_encoder(self.teacher_encoder, batch)
+        h_student, pad_student = self._encode_dense_with_encoder(self.flow_model.net.encoder, batch)
+
+        valid_mask = (~pad_student).unsqueeze(-1).to(h_student.dtype)
+        denom = valid_mask.sum().clamp_min(1.0)
+        distill_loss = ((h_student - h_teacher) ** 2 * valid_mask).sum() / denom
+        return distill_loss
+
     # ── lightning hooks ───────────────────────────────────────
 
     def on_fit_start(self):
@@ -162,11 +285,48 @@ class FlowMatchingTrainer(L.LightningModule):
         if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'num_atoms_histogram'):
             self._data_stats['num_atoms_histogram'] = self.trainer.datamodule.num_atoms_histogram
         self.flow_model.set_data_stats(self._data_stats)
+        self._maybe_init_teacher_encoder()
+        if self.use_self_distill:
+            print(
+                "Stage 2 distill config: "
+                f"weight={self.args.distill_weight}, decay={self.distill_decay}, min_ratio={self.distill_min_ratio}"
+            )
 
     def training_step(self, batch, batch_idx):
         self._set_current_data(batch)
         flow_batch = self._to_flow_batch(batch)
-        loss, _ = self.flow_model(flow_batch, compute_stats=False)
+        flow_loss, _ = self.flow_model(flow_batch, compute_stats=False)
+        loss = flow_loss
+
+        if self.use_self_distill:
+            distill_loss = self._compute_distill_loss(batch)
+            distill_weight_eff = self.args.distill_weight * self._distill_decay_ratio()
+            loss = loss + distill_weight_eff * distill_loss
+            self.log(
+                'train/distill_loss',
+                distill_loss,
+                batch_size=self.args.batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+            )
+            self.log(
+                'train/flow_loss',
+                flow_loss,
+                batch_size=self.args.batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+            )
+            self.log(
+                'train/distill_weight_eff',
+                distill_weight_eff,
+                batch_size=self.args.batch_size,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+            )
+
         self.log('train/loss', loss, batch_size=self.args.batch_size,
                  on_step=True, on_epoch=True, prog_bar=True)
         return loss
@@ -195,10 +355,41 @@ class FlowMatchingTrainer(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        params = [p for p in self.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(
-            params, lr=self.args.init_lr, weight_decay=self.args.weight_decay
-        )
+        if self.args.stage == 2 and self.args.encoder_lr_ratio != 1.0:
+            encoder_params = [
+                p for p in self.flow_model.net.encoder.parameters() if p.requires_grad
+            ]
+            encoder_ids = {id(p) for p in encoder_params}
+            other_params = [
+                p for p in self.parameters() if p.requires_grad and id(p) not in encoder_ids
+            ]
+            param_groups = []
+            if other_params:
+                param_groups.append(
+                    {'params': other_params, 'lr': self.args.init_lr, 'lr_scale': 1.0}
+                )
+            if encoder_params:
+                param_groups.append(
+                    {
+                        'params': encoder_params,
+                        'lr': self.args.init_lr * self.args.encoder_lr_ratio,
+                        'lr_scale': self.args.encoder_lr_ratio,
+                    }
+                )
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                weight_decay=self.args.weight_decay,
+            )
+            print(
+                f"Stage 2: using encoder_lr_ratio={self.args.encoder_lr_ratio} "
+                f"(encoder lr={self.args.init_lr * self.args.encoder_lr_ratio:.2e}, "
+                f"others lr={self.args.init_lr:.2e})."
+            )
+        else:
+            params = [p for p in self.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(
+                params, lr=self.args.init_lr, weight_decay=self.args.weight_decay
+            )
 
         if self.args.scheduler == 'linear_warmup_cosine_lr':
             self.trainer.fit_loop.setup_data()
@@ -221,6 +412,14 @@ class FlowMatchingTrainer(L.LightningModule):
         else:
             raise NotImplementedError(f"Unknown scheduler: {self.args.scheduler}")
 
+    def lr_scheduler_step(self, scheduler, metric):
+        if isinstance(scheduler, LinearWarmupCosineLRSchedulerV2):
+            scheduler.step(self.global_step)
+        elif metric is None:
+            scheduler.step()
+        else:
+            scheduler.step(metric)
+
 
 def main(args):
     L.seed_everything(args.seed, workers=True)
@@ -241,7 +440,9 @@ def main(args):
         # 清空 ckpt_path，避免 Lightning 再次尝试加载
         args.ckpt_path = None
 
-    if args.disable_compile:
+    if args.disable_compile or (args.stage == 2 and args.distill_weight > 0):
+        if args.stage == 2 and args.distill_weight > 0 and not args.disable_compile:
+            print("Compile disabled because self-distillation is enabled in stage 2.")
         pass
     else:
         trainer_model.flow_model.net.encoder = torch.compile(
@@ -355,6 +556,17 @@ if __name__ == '__main__':
                         help='Training stage: 1=freeze encoder, 2=finetune encoder')
     parser.add_argument('--stage1_ckpt', type=str, default=None,
                         help='Checkpoint from stage 1 to resume stage 2 training')
+    parser.add_argument('--distill_weight', type=float, default=0.0,
+                        help='Stage-2 self-distillation loss weight (0 disables distillation)')
+    parser.add_argument('--distill_decay', type=str, default='none',
+                        choices=['none', 'linear', 'cosine'],
+                        help='Decay schedule for distillation weight during Stage-2 finetuning')
+    parser.add_argument('--distill_min_ratio', type=float, default=0.0,
+                        help='Minimum ratio for decayed distill weight (effective weight = distill_weight * ratio)')
+    parser.add_argument('--encoder_lr_ratio', type=float, default=1.0,
+                        help='Stage-2 encoder lr ratio relative to init_lr (e.g., 0.1)')
+    parser.add_argument('--latent_noise_std', type=float, default=0.0,
+                        help='Stage-2 latent gaussian noise std at encoder output (train only)')
 
     # ── flow matching ─────────────────────────────────────────
     parser.add_argument('--time_distribution', type=str, default='uniform',
