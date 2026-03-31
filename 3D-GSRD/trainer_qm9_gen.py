@@ -12,6 +12,7 @@ from model.retrans import RelaTransEncoder
 from flow_matching.models.flow_matching_model import FlowMatchingModel
 from flow_matching.models.combined_net import CombinedNet
 from flow_matching.models.components.dae_decoder import DAEDecoder
+from flow_matching.models.components.losses import InterDistancesLoss
 from flow_matching.flow.interpolate import CenteredMetricInterpolant, DiscreteInterpolant
 from data_provider.qm9_dm import QM9DM
 from training_utils import custom_callbacks, load_encoder_params, print_args, device_cast
@@ -151,6 +152,18 @@ class FlowMatchingTrainer(L.LightningModule):
             key_pad_mask='padding_mask',
         )
 
+        interdist_loss = None
+        interdist_threshold = None
+        if args.geometry_dist_threshold > 0:
+            interdist_threshold = args.geometry_dist_threshold
+        if args.geometry_dist_loss_weight > 0:
+            interdist_loss = InterDistancesLoss(
+                distance_threshold=interdist_threshold,
+                sqrd=False,
+                key='coords',
+                key_pad_mask='padding_mask',
+            )
+
         # ── flow model ────────────────────────────────────────
         self.flow_model = FlowMatchingModel(
             net=net,
@@ -158,7 +171,10 @@ class FlowMatchingTrainer(L.LightningModule):
             atomics_interpolant=atomics_interpolant,
             time_distribution=args.time_distribution,
             time_alpha_factor=args.time_alpha_factor,
-            interdist_loss=None,
+            interdist_loss=interdist_loss,
+            interdist_loss_weight=args.geometry_dist_loss_weight,
+            chirality_loss_weight=args.chirality_loss_weight,
+            chirality_eps=args.chirality_eps,
             num_random_augmentations=None,
             sample_schedule=args.sample_schedule,
         )
@@ -567,6 +583,14 @@ if __name__ == '__main__':
                         help='Stage-2 encoder lr ratio relative to init_lr (e.g., 0.1)')
     parser.add_argument('--latent_noise_std', type=float, default=0.0,
                         help='Stage-2 latent gaussian noise std at encoder output (train only)')
+    parser.add_argument('--geometry_dist_loss_weight', type=float, default=0.0,
+                        help='Optional geometry prior: inter-atomic distance loss weight')
+    parser.add_argument('--geometry_dist_threshold', type=float, default=0.0,
+                        help='Optional threshold for geometry distance loss (<=0 disables threshold)')
+    parser.add_argument('--chirality_loss_weight', type=float, default=0.0,
+                        help='Optional local chirality consistency loss weight')
+    parser.add_argument('--chirality_eps', type=float, default=1e-4,
+                        help='Signed-volume magnitude cutoff for chirality loss')
 
     # ── flow matching ─────────────────────────────────────────
     parser.add_argument('--time_distribution', type=str, default='uniform',
